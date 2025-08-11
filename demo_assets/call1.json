@@ -1,0 +1,9 @@
+{
+  "callId": "C-1111aaaa",
+  "agentId": "007",
+  "locale": "en-US",
+  "channelCount": 1,
+  "sampleRateHz": 16000,
+  "tags": ["demo", "wav", "tone-440"],
+  "capturedAt": "2025-08-10T12:00:00Z"
+}

@@ -1,0 +1,9 @@
+{
+  "callId": "C-2222bxbb",
+  "agentId": "032",
+  "locale": "en-US",
+  "channelCount": 2,
+  "sampleRateHz": 44100,
+  "tags": ["demo", "m4a", "tone-880"],
+  "capturedAt": "2025-08-10T12:03:00Z"
+}
