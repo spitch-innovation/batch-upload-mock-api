@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from fastapi import FastAPI, Header, HTTPException, Depends, Path, Request, status, Query
-from fastapi.responses import JSONResponse, PlainTextResponse, FileResponse, HTMLResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field, AnyUrl, constr
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta, timezone
@@ -350,6 +350,54 @@ def create_recordings(req: RecordingsRequest, auth=Depends(require_api_key)):
 
     return RecordingsResponse(batch_id=batch_id, status="pending", items=out_items, poll={"href": f"/batches/{batch_id}"})
 
+
+# Add this endpoint to your mock-upload-api.py file
+
+@app.delete(
+    "/batches/{batch_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a batch and all its recordings and files",
+    tags=["Recordings"],
+)
+def delete_batch(batch_id: str = Path(..., description="Batch ID"), auth=Depends(require_api_key)):
+    with db() as conn:
+        # First, check if the batch exists
+        batch_exists = conn.execute("SELECT id FROM batches WHERE id=?", (batch_id,)).fetchone()
+        if not batch_exists:
+            raise HTTPException(status_code=404, detail="Batch not found")
+
+        # Find all recordings and their blob references for this batch
+        recs_to_delete = conn.execute("SELECT id, blob_ref FROM recordings WHERE batch_id=?", (batch_id,)).fetchall()
+        blob_refs_to_delete = [r["blob_ref"] for r in recs_to_delete]
+
+        # Find the physical paths of the blobs to delete the files
+        if blob_refs_to_delete:
+            placeholders = ",".join("?" * len(blob_refs_to_delete))
+            blobs_to_delete = conn.execute(f"SELECT path FROM blobs WHERE blob_ref IN ({placeholders})", blob_refs_to_delete).fetchall()
+            
+            # Delete the actual files from the storage directory
+            for blob in blobs_to_delete:
+                try:
+                    file_path = FSPath(blob["path"])
+                    if file_path.exists():
+                        os.remove(file_path)
+                except Exception as e:
+                    # Log error but continue cleanup
+                    print(f"Warning: Could not delete file {blob['path']}: {e}")
+        
+        # In a single transaction, delete all database records
+        # The order is important to respect relationships
+        if blob_refs_to_delete:
+            conn.execute(f"DELETE FROM blobs WHERE blob_ref IN ({placeholders})", blob_refs_to_delete)
+            conn.execute(f"DELETE FROM batch_uploads WHERE blob_ref IN ({placeholders})", blob_refs_to_delete)
+        
+        conn.execute("DELETE FROM recordings WHERE batch_id=?", (batch_id,))
+        conn.execute("DELETE FROM batches WHERE id=?", (batch_id,))
+        
+        conn.commit()
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 # ------------------------------------------------------------------------------
 # Endpoint: GET /batches/{batch_id}
 
@@ -473,6 +521,67 @@ def ui(
     """
     return HTMLResponse(html)
 
+@app.get(
+    "/jsonui",
+    summary="[JSON API] Get all batches and their recordings",
+    # This endpoint is kept for compatibility, but you might rename it to /api/batches
+    tags=["UI & Reporting"],
+    include_in_schema=True, # It's a real endpoint now, so we can include it in docs
+)
+def get_batches_as_json(
+    key: Optional[str] = Query(None, description="API key for browser access"),
+):
+    # 1. Authentication check now returns JSON errors
+    if not key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing X-API-Key")
+    
+    if key != TEST_API_KEY:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid X-API-Key")
+
+    # 2. Database query remains the same
+    with db() as conn:
+        batches_rows = conn.execute("SELECT id, status, created_at FROM batches ORDER BY created_at DESC").fetchall()
+        recs_by_batch: Dict[str, List[sqlite3.Row]] = {}
+        for b in batches_rows:
+            recs = conn.execute("""
+                SELECT r.id as rec_id, r.client_item_id, r.status, r.data_json,
+                       bl.size_bytes, bl.content_type
+                FROM recordings r
+                LEFT JOIN blobs bl ON bl.blob_ref = r.blob_ref
+                WHERE r.batch_id=?
+                ORDER BY r.created_at ASC
+            """, (b["id"],)).fetchall()
+            recs_by_batch[b["id"]] = recs
+    # 3. Data is now structured into a Python list of dictionaries
+    output_batches = []
+    for b in batches_rows:
+        recordings_list = []
+        # Get the recordings for the current batch
+        for r in recs_by_batch.get(b["id"], []):
+            # Parse the metadata from its JSON string format
+            metadata = json.loads(r["data_json"] or "{}")
+            
+            recordings_list.append({
+                "recording_id": r["rec_id"],
+                "client_item_id": r["client_item_id"],
+                "status": r["status"],
+                "metadata": metadata,
+                "size_bytes": r["size_bytes"] or 0,
+                "content_type": r["content_type"] or "",
+                "media_url": f"/media/{r['rec_id']}?key={key}" # Provide a direct URL to the media
+            })
+
+        output_batches.append({
+            "batch_id": b["id"],
+            "status": b["status"],
+            "created_at": b["created_at"],
+            "recordings": recordings_list
+        })
+    
+    # 4. Return a JSONResponse with the structured data
+    return JSONResponse(content=output_batches)
+
+    
 @app.get("/media/{recording_id}", include_in_schema=False)
 def media(
     recording_id: str,
