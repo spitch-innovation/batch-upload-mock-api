@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-from fastapi import FastAPI, Header, HTTPException, Depends, Path, Request, status, Query
+from fastapi import FastAPI, Header, HTTPException, Depends, Path, Request, status, Query, BackgroundTasks
 from fastapi.responses import JSONResponse, PlainTextResponse, FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field, AnyUrl, constr
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta, timezone
 import hashlib, os, uuid, json, sqlite3
 from pathlib import Path as FSPath
+from transcriber import run_transcription
 
 app = FastAPI(
     title="Recordings Ingest Mock API",
@@ -54,13 +55,14 @@ def require_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
 # SQLite helpers
 
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     with db() as conn:
+        # --- Blob store (uploaded audio bytes) ---
         conn.execute("""
         CREATE TABLE IF NOT EXISTS blobs (
             blob_ref TEXT PRIMARY KEY,
@@ -68,14 +70,22 @@ def init_db():
             size_bytes INTEGER,
             content_type TEXT,
             uploaded_at TEXT
-        )""")
+        )
+        """)
+
+        # --- Batch lifecycle ---
         conn.execute("""
         CREATE TABLE IF NOT EXISTS batches (
             id TEXT PRIMARY KEY,
-            status TEXT,          -- open, pending, processing, completed, failed
+            status TEXT,           -- open | pending | processing | completed | failed
             idem_key TEXT,
-            created_at TEXT
-        )""")
+            created_at TEXT,
+            updated_at TEXT,
+            completed_at TEXT
+        )
+        """)
+
+        # --- Recordings (metadata + blob + transcript) ---
         conn.execute("""
         CREATE TABLE IF NOT EXISTS recordings (
             id TEXT PRIMARY KEY,
@@ -83,22 +93,55 @@ def init_db():
             tenant_id TEXT,
             client_item_id TEXT,
             blob_ref TEXT,
-            status TEXT,
+            status TEXT,           -- created | pending | completed | failed
             data_json TEXT,
+            transcript_json TEXT,  -- JSON transcript (array of utterances)
             created_at TEXT,
+            updated_at TEXT,
+            completed_at TEXT,
             FOREIGN KEY(batch_id) REFERENCES batches(id)
-        )""")
-        # NEW: link presigned/uploads to a batch even before /recordings
+        )
+        """)
+
+        # --- Early blob links (pre-recording uploads) ---
         conn.execute("""
         CREATE TABLE IF NOT EXISTS batch_uploads (
             blob_ref TEXT PRIMARY KEY,
             batch_id TEXT NOT NULL,
             created_at TEXT
-        )""")
-        # simple indexes
+        )
+        """)
+
+        # --- Ensure new columns exist after upgrades ---
+        # transcript_json was added later
+        try:
+            conn.execute("ALTER TABLE recordings ADD COLUMN transcript_json TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE recordings ADD COLUMN updated_at TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE recordings ADD COLUMN completed_at TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE batches ADD COLUMN updated_at TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE batches ADD COLUMN completed_at TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        # --- Indexes ---
         conn.execute("CREATE INDEX IF NOT EXISTS idx_recordings_batch ON recordings(batch_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_batch_uploads_batch ON batch_uploads(batch_id)")
+
         conn.commit()
+
 
 @app.on_event("startup")
 def on_startup():
@@ -106,6 +149,34 @@ def on_startup():
 
 # ------------------------------------------------------------------------------
 # Schemas
+
+async def transcription_background_task(recording_id: str, file_path: str):
+    """
+    A wrapper function that runs in the background.
+    It calls the main transcription logic and updates the DB with the result.
+    """
+    print(f"[BackgroundTask] Starting for recording_id: {recording_id}")
+    # 1. Call the external transcriber function
+    result = await run_transcription(file_path)
+
+    # 2. Update the database with the result
+    with db() as conn:
+        now = now_utc().isoformat()
+        if "error" in result:
+            status = "failed"
+            transcript_payload = json.dumps(result)
+            print(f"[BackgroundTask] FAILED for recording_id: {recording_id}")
+        else:
+            status = "completed"
+            transcript_payload = json.dumps(result)
+            print(f"[BackgroundTask] COMPLETED for recording_id: {recording_id}")
+
+        conn.execute(
+            "UPDATE recordings SET status=?, transcript_json=?, updated_at=?, completed_at=? WHERE id=?",
+            (status, transcript_payload, now, now, recording_id)
+        )
+        conn.commit()
+
 
 def example_blob_ref():
     return "blob://s3/rec-bucket/tenants/tn_demo/2025/08/11/rec_abc123/call1.wav"
@@ -153,7 +224,9 @@ class RecordingsRequest(BaseModel):
 class RecordingItemOut(BaseModel):
     client_item_id: str = Field(..., example="c1")
     recording_id: str = Field(..., example="rec_01H8X8R6ZK3YQ9A2ZB7J")
-    status: str = Field(..., example="queued")
+    status: str = Field(..., example="pending")
+    transcript: Optional[Any] = Field(None, description="The final transcript object, available when status is 'completed'")
+
 
 class RecordingsResponse(BaseModel):
     batch_id: str = Field(..., example="rb_01J8X8RJ6H8J9Z")
@@ -244,7 +317,7 @@ def presign_uploads(req: PresignRequest, request: Request, auth=Depends(require_
                 "batch_id": batch_id,
             }
 
-            upload_url = f"{base}/mock/mock-upload/{upload_id}?token={token}"
+            upload_url = f"{base}/mock-upload/{upload_id}?token={token}"
 
             items_out.append(PresignedItemOut(
                 temp_id=new_id("tmp")[:12],
@@ -301,56 +374,74 @@ async def mock_upload(
 
 # ------------------------------------------------------------------------------
 # Endpoint: POST /recordings  (batch-aware; persists to SQLite)
-
+# MODIFIED: Endpoint: POST /recordings (Triggers background transcription)
 @app.post(
     "/recordings",
     response_model=RecordingsResponse,
     summary="Create or append to a recording batch with metadata",
     tags=["Recordings"],
 )
-def create_recordings(req: RecordingsRequest, auth=Depends(require_api_key)):
+async def create_recordings(
+    req: RecordingsRequest,
+    background_tasks: BackgroundTasks, 
+    auth=Depends(require_api_key)
+):
     tenant_id = auth["tenant_id"]
-
     with db() as conn:
-        # ensure batch (existing or new)
+        # 1. Ensure batch (existing or new)
         batch_id = ensure_open_batch(conn, req.batch_id)
 
-        # verify each blob exists and belongs to this batch
+        # 2. Verify each blob exists and belongs to this batch
         for it in req.items:
             exists = conn.execute("SELECT 1 FROM blobs WHERE blob_ref=?", (it.blob_ref,)).fetchone()
             if not exists:
                 raise HTTPException(status_code=409, detail=f"Blob not found for client_item_id={it.client_item_id}")
+            
             link = conn.execute("SELECT batch_id FROM batch_uploads WHERE blob_ref=?", (it.blob_ref,)).fetchone()
             if not link or link["batch_id"] != batch_id:
                 raise HTTPException(status_code=409, detail=f"Blob for client_item_id={it.client_item_id} is not linked to batch {batch_id}")
 
-        # idempotency (scoped to this batch)
+        # 3. Idempotency (scoped to this batch)
         request_hash = hashlib.sha256(("|".join([i.client_item_id + i.blob_ref for i in req.items]) + f":{batch_id}").encode()).hexdigest()
         idem_key = f"{tenant_id}:{req.idempotency_key}:{request_hash}"
         existing = conn.execute("SELECT id, status FROM batches WHERE idem_key=?", (idem_key,)).fetchone()
+        
         if existing:
             batch_id = existing["id"]
-            rec_rows = conn.execute("SELECT client_item_id, id, status FROM recordings WHERE batch_id=?", (batch_id,)).fetchall()
-            items = [RecordingItemOut(client_item_id=r["client_item_id"], recording_id=r["id"], status=r["status"]) for r in rec_rows]
+            rec_rows = conn.execute("SELECT client_item_id, id, status, transcript_json FROM recordings WHERE batch_id=?", (batch_id,)).fetchall()
+            items = [
+                RecordingItemOut(
+                    client_item_id=r["client_item_id"],
+                    recording_id=r["id"],
+                    status=r["status"],
+                    transcript=json.loads(r["transcript_json"]) if r["transcript_json"] else None
+                ) for r in rec_rows
+            ]
             return RecordingsResponse(batch_id=batch_id, status=existing["status"], items=items, poll={"href": f"/batches/{batch_id}"})
 
-        # mark/keep batch status 'pending' when we have items
-        conn.execute("UPDATE batches SET status=?, idem_key=? WHERE id=?", ("pending", idem_key, batch_id))
+        conn.execute("UPDATE batches SET status=?, idem_key=?, updated_at=? WHERE id=?", ("pending", idem_key, now_utc().isoformat(), batch_id))
 
         out_items: List[RecordingItemOut] = []
         for it in req.items:
             rec_id = new_id("rec")
+            
             conn.execute(
                 "INSERT INTO recordings(id, batch_id, tenant_id, client_item_id, blob_ref, status, data_json, created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (rec_id, batch_id, tenant_id, it.client_item_id, it.blob_ref, "queued", json.dumps(it.data), now_utc().isoformat())
+                (rec_id, batch_id, tenant_id, it.client_item_id, it.blob_ref, "pending", json.dumps(it.data), now_utc().isoformat())
             )
-            out_items.append(RecordingItemOut(client_item_id=it.client_item_id, recording_id=rec_id, status="queued"))
+
+            blob_row = conn.execute("SELECT path FROM blobs WHERE blob_ref=?", (it.blob_ref,)).fetchone()
+            if blob_row:
+                background_tasks.add_task(transcription_background_task, rec_id, blob_row['path'])
+            else:
+                conn.execute("UPDATE recordings SET status='failed', updated_at=? WHERE id=?", (now_utc().isoformat(), rec_id,))
+                print(f"Could not find blob path for {it.blob_ref}, marking recording {rec_id} as failed.")
+
+            out_items.append(RecordingItemOut(client_item_id=it.client_item_id, recording_id=rec_id, status="pending"))
 
         conn.commit()
 
     return RecordingsResponse(batch_id=batch_id, status="pending", items=out_items, poll={"href": f"/batches/{batch_id}"})
-
-
 # Add this endpoint to your mock-upload-api.py file
 
 @app.delete(
@@ -400,29 +491,35 @@ def delete_batch(batch_id: str = Path(..., description="Batch ID"), auth=Depends
 
 # ------------------------------------------------------------------------------
 # Endpoint: GET /batches/{batch_id}
-
-@app.get(
-    "/batches/{batch_id}",
-    response_model=BatchStatusResponse,
-    summary="Get batch status",
-    tags=["Recordings"],
-)
-def get_batch(batch_id: str = Path(..., description="Batch ID"), auth=Depends(require_api_key)):
+@app.get("/batches/{batch_id}", response_model=BatchStatusResponse, tags=["Recordings"])
+def get_batch(batch_id: str, auth=Depends(require_api_key)):
     with db() as conn:
         row = conn.execute("SELECT id, status FROM batches WHERE id=?", (batch_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Batch not found")
-        rec_rows = conn.execute("SELECT client_item_id, id, status FROM recordings WHERE batch_id=?", (batch_id,)).fetchall()
-        items = [RecordingItemOut(client_item_id=r["client_item_id"], recording_id=r["id"], status=r["status"]) for r in rec_rows]
+
+        # MODIFIED: Query now includes transcript_json
+        rec_rows = conn.execute(
+            "SELECT client_item_id, id, status, transcript_json FROM recordings WHERE batch_id=?", (batch_id,)
+        ).fetchall()
+
+        items = [
+            RecordingItemOut(
+                client_item_id=r["client_item_id"],
+                recording_id=r["id"],
+                status=r["status"],
+                transcript=json.loads(r["transcript_json"]) if r["transcript_json"] else None,
+            ) for r in rec_rows
+        ]
         return BatchStatusResponse(batch_id=row["id"], status=row["status"], items=items)
 
 # ------------------------------------------------------------------------------
 # UI (batch-grouped) & media endpoints
-
 @app.get("/ui", include_in_schema=False)
 def ui(
     key: Optional[str] = Query(None, description="API key for browser access"),
 ):
+    # (Authentication logic is unchanged)
     if not key:
         return HTMLResponse(f"""
         <html><body style="font-family: system-ui; padding: 24px">
@@ -453,8 +550,9 @@ def ui(
         batches_rows = conn.execute("SELECT id, status, created_at FROM batches ORDER BY created_at DESC").fetchall()
         recs_by_batch: Dict[str, List[sqlite3.Row]] = {}
         for b in batches_rows:
+            # MODIFIED: Query now fetches transcript_json
             recs = conn.execute("""
-                SELECT r.id as rec_id, r.client_item_id, r.status, r.data_json,
+                SELECT r.id as rec_id, r.client_item_id, r.status, r.transcript_json,
                        bl.size_bytes, bl.content_type
                 FROM recordings r
                 LEFT JOIN blobs bl ON bl.blob_ref = r.blob_ref
@@ -468,18 +566,37 @@ def ui(
         rows = recs_by_batch.get(b["id"], [])
         row_html = []
         for r in rows:
-            meta = json.loads(r["data_json"] or "{}")
+            # NEW: Logic to create a user-friendly display for the transcript
+            transcript_display = "N/A" # Default
+            if r['status'] == 'pending':
+                transcript_display = "⏳ In Progress..."
+            elif r['transcript_json']:
+                transcript_data = json.loads(r['transcript_json'])
+                if 'error' in transcript_data:
+                    transcript_display = f"<span style='color:red'>❌ Failed: {transcript_data['error']}</span>"
+                else:
+                    utterance_count = len(transcript_data.get('utterances', []))
+                    transcript_display = f"""
+                    <details>
+                      <summary>✅ Completed ({utterance_count} utterances)</summary>
+                      <pre style="margin:0; max-height: 200px; overflow-y:auto; background:#f4f4f4; padding:8px; border-radius:4px;">{json.dumps(transcript_data, indent=2)}</pre>
+                    </details>
+                    """
+            elif r['status'] == 'failed':
+                transcript_display = "❌ Failed"
+
             row_html.append(f"""
             <tr>
               <td>{r['rec_id']}</td>
               <td>{r['client_item_id']}</td>
               <td>{r['status']}</td>
-              <td><pre style="margin:0">{json.dumps(meta, indent=2)}</pre></td>
               <td>{r['size_bytes'] or 0}</td>
               <td>{r['content_type'] or ''}</td>
-              <td><audio controls src="/mock/media/{r['rec_id']}?key={key}"></audio></td>
+              <td>{transcript_display}</td>
+              <td><audio controls src="/media/{r['rec_id']}?key={key}"></audio></td>
             </tr>
             """)
+            
         sections.append(f"""
         <section style="margin: 20px 0; border:1px solid #ddd; border-radius:8px; padding:12px">
           <h2 style="margin:0 0 8px 0">Batch: {b['id']} <small style="color:#666">({b['status']})</small></h2>
@@ -489,9 +606,9 @@ def ui(
                 <th style="border:1px solid #ddd; padding:6px">Recording ID</th>
                 <th style="border:1px solid #ddd; padding:6px">Client Item</th>
                 <th style="border:1px solid #ddd; padding:6px">Status</th>
-                <th style="border:1px solid #ddd; padding:6px">Metadata</th>
                 <th style="border:1px solid #ddd; padding:6px">Size</th>
                 <th style="border:1px solid #ddd; padding:6px">Type</th>
+                <th style="border:1px solid #ddd; padding:6px">Transcript</th>
                 <th style="border:1px solid #ddd; padding:6px">Preview</th>
               </tr>
             </thead>
@@ -509,6 +626,7 @@ def ui(
       <style>
         body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 16px; }}
         h1 {{ margin-top: 0; }}
+        td {{ vertical-align: top; }}
       </style>
     </head>
     <body>
@@ -524,27 +642,27 @@ def ui(
 @app.get(
     "/jsonui",
     summary="[JSON API] Get all batches and their recordings",
-    # This endpoint is kept for compatibility, but you might rename it to /api/batches
     tags=["UI & Reporting"],
-    include_in_schema=True, # It's a real endpoint now, so we can include it in docs
+    include_in_schema=True,
 )
 def get_batches_as_json(
     key: Optional[str] = Query(None, description="API key for browser access"),
 ):
-    # 1. Authentication check now returns JSON errors
+    # 1. Authentication check (unchanged)
     if not key:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing X-API-Key")
     
     if key != TEST_API_KEY:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid X-API-Key")
 
-    # 2. Database query remains the same
+    # 2. Database query
     with db() as conn:
         batches_rows = conn.execute("SELECT id, status, created_at FROM batches ORDER BY created_at DESC").fetchall()
         recs_by_batch: Dict[str, List[sqlite3.Row]] = {}
         for b in batches_rows:
+            # MODIFIED: Query now fetches transcript_json from the recordings table
             recs = conn.execute("""
-                SELECT r.id as rec_id, r.client_item_id, r.status, r.data_json,
+                SELECT r.id as rec_id, r.client_item_id, r.status, r.data_json, r.transcript_json,
                        bl.size_bytes, bl.content_type
                 FROM recordings r
                 LEFT JOIN blobs bl ON bl.blob_ref = r.blob_ref
@@ -552,23 +670,26 @@ def get_batches_as_json(
                 ORDER BY r.created_at ASC
             """, (b["id"],)).fetchall()
             recs_by_batch[b["id"]] = recs
-    # 3. Data is now structured into a Python list of dictionaries
+            
+    # 3. Structure data into a Python list of dictionaries
     output_batches = []
     for b in batches_rows:
         recordings_list = []
-        # Get the recordings for the current batch
         for r in recs_by_batch.get(b["id"], []):
-            # Parse the metadata from its JSON string format
+            # Parse the metadata and transcript from their JSON string format
             metadata = json.loads(r["data_json"] or "{}")
+            transcript = json.loads(r["transcript_json"]) if r["transcript_json"] else None
             
+            # MODIFIED: Add the transcript to the recording's JSON object
             recordings_list.append({
                 "recording_id": r["rec_id"],
                 "client_item_id": r["client_item_id"],
                 "status": r["status"],
                 "metadata": metadata,
+                "transcript": transcript, # NEW: The parsed transcript object
                 "size_bytes": r["size_bytes"] or 0,
                 "content_type": r["content_type"] or "",
-                "media_url": f"/media/{r['rec_id']}?key={key}" # Provide a direct URL to the media
+                "media_url": f"/media/{r['rec_id']}?key={key}"
             })
 
         output_batches.append({
