@@ -244,7 +244,7 @@ def presign_uploads(req: PresignRequest, request: Request, auth=Depends(require_
                 "batch_id": batch_id,
             }
 
-            upload_url = f"{base}/mock-upload/{upload_id}?token={token}"
+            upload_url = f"{base}/mock/mock-upload/{upload_id}?token={token}"
 
             items_out.append(PresignedItemOut(
                 temp_id=new_id("tmp")[:12],
@@ -477,7 +477,7 @@ def ui(
               <td><pre style="margin:0">{json.dumps(meta, indent=2)}</pre></td>
               <td>{r['size_bytes'] or 0}</td>
               <td>{r['content_type'] or ''}</td>
-              <td><audio controls src="/media/{r['rec_id']}?key={key}"></audio></td>
+              <td><audio controls src="/mock/media/{r['rec_id']}?key={key}"></audio></td>
             </tr>
             """)
         sections.append(f"""
