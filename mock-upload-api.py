@@ -197,7 +197,7 @@ class PresignRequest(BaseModel):
 class PresignedItemOut(BaseModel):
     temp_id: str = Field(..., example="tmp_b3c2f4a1e2")
     method: str = Field("PUT", example="PUT")
-    upload_url: AnyUrl = Field(..., example="http://localhost:8000/mock-upload/upl_abc123?token=eyJ...")
+    upload_url: AnyUrl = Field(..., example="http://localhost:8000/mock/mock-upload/upl_abc123?token=eyJ...")
     required_headers: Dict[str, str] = Field(default_factory=dict, example={"Content-Type": "audio/wav"})
     blob_ref: str = Field(..., example=example_blob_ref())
 
@@ -317,7 +317,7 @@ def presign_uploads(req: PresignRequest, request: Request, auth=Depends(require_
                 "batch_id": batch_id,
             }
 
-            upload_url = f"{base}/mock-upload/{upload_id}?token={token}"
+            upload_url = f"{base}/mock/mock-upload/{upload_id}?token={token}"
 
             items_out.append(PresignedItemOut(
                 temp_id=new_id("tmp")[:12],
